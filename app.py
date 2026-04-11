@@ -11,8 +11,18 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from melspec import plot_colored_polar, plot_melspec
 
-# load models
-model = load_model("model3.h5")
+# load only self-trained models
+SER_MODEL_PATH = os.getenv("SER_MODEL_PATH", "model3_self_trained.h5")
+GENDER_MODEL_PATH = os.getenv("GENDER_MODEL_PATH", "model_mw_self_trained.h5")
+
+if not os.path.exists(SER_MODEL_PATH):
+    st.error(
+        "Missing self-trained emotion model. "
+        "Train it first with `python train_from_scratch.py`."
+    )
+    st.stop()
+
+model = load_model(SER_MODEL_PATH)
 
 # constants
 starttime = datetime.now()
@@ -33,6 +43,57 @@ COLOR_DICT = {"neutral": "grey",
 
 TEST_CAT = ['fear', 'disgust', 'neutral', 'happy', 'sad', 'surprise', 'angry']
 TEST_PRED = np.array([.3, .3, .4, .1, .6, .9, .1])
+EMOTION_EMOJI = {
+    "fear": "😨",
+    "angry": "😠",
+    "neutral": "😐",
+    "happy": "😊",
+    "sad": "😢",
+    "surprise": "😲",
+    "disgust": "🤢",
+}
+
+EMOTION_LABELS_PATH = os.getenv("SER_LABELS_PATH", "model3_self_trained.labels.txt")
+EMOTION_ALIASES = {
+    "fear": {"fear", "fearful"},
+    "angry": {"angry", "negative", "disgust"},
+    "neutral": {"neutral", "calm"},
+    "happy": {"happy", "positive"},
+    "sad": {"sad"},
+    "surprise": {"surprise", "surprised"},
+}
+
+
+def load_emotion_model_labels(path=EMOTION_LABELS_PATH):
+    if not os.path.exists(path):
+        return CAT6
+    with open(path, "r", encoding="utf-8") as f:
+        labels = [line.strip().lower() for line in f if line.strip()]
+    return labels or CAT6
+
+
+MODEL_EMOTION_LABELS = load_emotion_model_labels()
+
+
+def remap_pred_to_ui(predictions):
+    label_to_idx = {label: idx for idx, label in enumerate(MODEL_EMOTION_LABELS)}
+    ui_pred = np.zeros(len(CAT6), dtype=np.float32)
+    for ui_idx, ui_label in enumerate(CAT6):
+        aliases = EMOTION_ALIASES.get(ui_label, {ui_label})
+        for alias in aliases:
+            src_idx = label_to_idx.get(alias)
+            if src_idx is not None and src_idx < len(predictions):
+                ui_pred[ui_idx] += float(predictions[src_idx])
+    return ui_pred
+
+
+def sentiment_scores_from_ui(ui_pred):
+    idx = {name: i for i, name in enumerate(CAT6)}
+    pos = ui_pred[idx["happy"]] + ui_pred[idx["surprise"]] * 0.5
+    neu = ui_pred[idx["neutral"]] + ui_pred[idx["surprise"]] * 0.5 + ui_pred[idx["sad"]] * 0.5
+    neg = ui_pred[idx["fear"]] + ui_pred[idx["angry"]] + ui_pred[idx["sad"]] * 0.5
+    return np.array([pos, neu, neg], dtype=np.float32)
+
 
 # page settings
 st.set_page_config(page_title="SER web-app", page_icon=":speech_balloon:", layout="wide")
@@ -95,28 +156,46 @@ def get_melspec(audio):
 # @st.cache
 def get_mfccs(audio, limit):
     y, sr = librosa.load(audio)
-    a = librosa.feature.mfcc(y, sr=sr, n_mfcc=40)
+    a = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
     if a.shape[1] > limit:
         mfccs = a[:, :limit]
     elif a.shape[1] < limit:
-        mfccs = np.zeros((a.shape[0], limit))
+        mfccs = np.zeros((a.shape[0], limit), dtype=np.float32)
         mfccs[:, :a.shape[1]] = a
+    else:
+        mfccs = a
     return mfccs
 
 
-@st.cache
+def prepare_mfcc_input(audio_path, keras_model):
+    shape = keras_model.input_shape
+    if isinstance(shape, list):
+        shape = shape[0]
+
+    if len(shape) == 4:
+        # Expected shape: (None, 40, time_steps, channels)
+        limit = int(shape[2])
+        mfccs = get_mfccs(audio_path, limit)
+        return mfccs.reshape(1, mfccs.shape[0], mfccs.shape[1], 1)
+
+    # Backward compatibility with older 3D models: (None, 40, time_steps)
+    limit = int(shape[-1])
+    mfccs = get_mfccs(audio_path, limit)
+    return mfccs.reshape(1, *mfccs.shape)
+
+
+@st.cache_data
 def get_title(predictions, categories=CAT6):
     title = f"Detected emotion: {categories[predictions.argmax()]} \
     - {predictions.max() * 100:.2f}%"
     return title
 
 
-@st.cache
+@st.cache_data
 def color_dict(coldict=COLOR_DICT):
     return COLOR_DICT
 
 
-@st.cache
 def plot_polar(fig, predictions=TEST_PRED, categories=TEST_CAT,
                title="TEST", colors=COLOR_DICT):
     # color_sector = "grey"
@@ -153,22 +232,235 @@ def plot_polar(fig, predictions=TEST_PRED, categories=TEST_CAT,
     plt.subplots_adjust(top=0.75)
 
 
+def apply_ui_theme():
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&display=swap');
+
+        :root {
+            --bg-soft: #eef3ff;
+            --bg-cream: #f8fafc;
+            --ink-1: #0f172a;
+            --ink-2: #334155;
+            --line: rgba(30, 58, 138, 0.18);
+            --brand-a: #1e3a8a;
+            --brand-b: #0284c7;
+        }
+
+        html, body, [class*="css"] {
+            font-family: "Manrope", "Trebuchet MS", "Segoe UI", sans-serif;
+        }
+
+       .stApp {
+            background:
+              radial-gradient(circle at 10% 10%, rgba(124, 58, 237, 0.45) 0%, transparent 55%),
+              radial-gradient(circle at 90% 25%, rgba(6, 182, 212, 0.35) 0%, transparent 55%),
+              radial-gradient(circle at 70% 95%, rgba(16, 185, 129, 0.25) 0%, transparent 55%),
+              linear-gradient(180deg, #050814 0%, #0b1220 55%, #060a18 100%);
+        }
+
+        .block-container {
+            padding-top: 1.15rem !important;
+            padding-bottom: 1.8rem !important;
+            max-width: 1180px;
+        }
+
+        .hero {
+            background: linear-gradient(120deg, #0f172a 0%, var(--brand-a) 50%, #0ea5e9 100%);
+            color: #ffffff;
+            border-radius: 18px;
+            padding: 1.15rem 1.25rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.18);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+        }
+
+        .hero h1 {
+            margin: 0;
+            font-size: 1.65rem;
+            font-weight: 800;
+            letter-spacing: 0.2px;
+            color: #ffffff;
+        }
+
+        .hero p {
+            margin: 0.4rem 0 0;
+            font-size: 0.95rem;
+            opacity: 0.95;
+        }
+
+        .panel-title {
+            margin: 0.5rem 0 0.6rem;
+            color: #ffffff;
+            font-size: 1.08rem;
+            font-weight: 700;
+        }
+
+        .stat-chip {
+            background: rgba(255, 255, 255, 0.8);
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            padding: 0.52rem 0.78rem;
+            margin-bottom: 0.75rem;
+            color: var(--ink-2);
+            font-size: 0.86rem;
+            font-weight: 700;
+            text-align: center;
+            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.07);
+        }
+
+        .subtle-note {
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid var(--line);
+            color: var(--ink-2);
+            border-radius: 12px;
+            padding: 0.58rem 0.72rem;
+            margin: 0.2rem 0 0.9rem;
+            font-size: 0.86rem;
+        }
+
+        .section-divider {
+            height: 1px;
+            width: 100%;
+            margin: 0.35rem 0 1rem;
+            background: linear-gradient(90deg, transparent 0%, rgba(30, 58, 138, 0.42) 12%, rgba(30, 58, 138, 0.14) 88%, transparent 100%);
+        }
+
+        div[data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #f8fafc 0%, #eaf1ff 100%);
+            border-right: 1px solid rgba(15, 23, 42, 0.08);
+        }
+
+        div[data-testid="stSidebarContent"] {
+            padding-top: 0.2rem;
+        }
+
+        div[data-testid="stSidebar"] [data-testid="stImage"] {
+            margin-top: 0 !important;
+            margin-bottom: 1rem;
+        }
+
+        div[data-testid="stSidebar"] [data-testid="stImage"] img {
+            border-radius: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.45);
+            box-shadow: 0 14px 34px rgba(15, 23, 42, 0.24), 0 0 0 4px rgba(255, 255, 255, 0.12);
+            filter: saturate(1.08) contrast(1.03);
+            transition: transform 0.25s ease, box-shadow 0.25s ease, filter 0.25s ease;
+        }
+
+        div[data-testid="stSidebar"] [data-testid="stImage"] img:hover {
+            transform: translateY(-2px) scale(1.01);
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.3), 0 0 0 4px rgba(255, 255, 255, 0.18);
+            filter: saturate(1.14) contrast(1.05);
+        }
+
+        div[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+            color: var(--ink-2);
+        }
+
+        div[data-testid="stFileUploaderDropzone"] {
+            border: 2px dashed rgba(30, 58, 138, 0.48);
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.76);
+            transition: all 0.2s ease-in-out;
+        }
+
+        div[data-testid="stFileUploaderDropzone"]:hover {
+            border-color: rgba(2, 132, 199, 0.8);
+            box-shadow: 0 8px 18px rgba(2, 132, 199, 0.15);
+        }
+
+        div[data-testid="stFileUploaderFile"] * {
+            color: #ffffff !important;
+        }
+
+        .result-card {
+            background: linear-gradient(130deg, rgba(255,255,255,0.95) 0%, rgba(224,242,254,0.95) 100%);
+            border: 1px solid rgba(2, 132, 199, 0.35);
+            border-radius: 16px;
+            padding: 0.9rem 1rem;
+            box-shadow: 0 10px 24px rgba(2, 132, 199, 0.12);
+            margin: 0.5rem 0 0.8rem;
+        }
+
+        .result-label {
+            color: #0c4a6e;
+            font-size: 0.78rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin: 0 0 0.25rem 0;
+        }
+
+        .result-main {
+            color: #0f172a;
+            font-size: 1.2rem;
+            font-weight: 800;
+            margin: 0;
+            line-height: 1.25;
+        }
+
+        .result-sub {
+            color: #334155;
+            font-size: 0.9rem;
+            font-weight: 700;
+            margin: 0.32rem 0 0;
+        }
+
+        .stButton > button {
+            border: 0;
+            border-radius: 11px;
+            background: linear-gradient(120deg, var(--brand-a) 0%, var(--brand-b) 100%);
+            color: white;
+            font-weight: 700;
+            box-shadow: 0 8px 20px rgba(2, 132, 199, 0.22);
+        }
+
+        .stButton > button:hover {
+            filter: brightness(1.05);
+        }
+
+        [data-testid="stCheckbox"] label p {
+            font-weight: 600;
+            color: var(--ink-2);
+        }
+
+        [data-testid="stHeader"] {
+            background: transparent;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main():
-    side_img = Image.open("images/emotion3.jpg")
-    with st.sidebar:
-        st.image(side_img, width=300)
-    st.sidebar.subheader("Menu")
-    website_menu = st.sidebar.selectbox("Menu", ("Emotion Recognition", "Project description", "Our team",
-                                                 "Leave feedback", "Relax"))
+    apply_ui_theme()
+    website_menu = "Emotion Recognition"
     st.set_option('deprecation.showfileUploaderEncoding', False)
 
     if website_menu == "Emotion Recognition":
-        st.sidebar.subheader("Model")
-        model_type = st.sidebar.selectbox("How would you like to predict?", ("mfccs", "mel-specs"))
-        em3 = em6 = em7 = gender = False
-        st.sidebar.subheader("Settings")
+        model_type = "mfccs"
+        em3 = em6 = gender = True
+        audio_file = None
+        path = None
+        wav = sr = Xdb = mfccs = None
+        pred = data3 = None
+        top_emotion = sentiment = None
+        top_conf = 0.0
 
-        st.markdown("## Upload the file")
+        st.markdown(
+            """
+            <div class="hero">
+                <h1>Speech Emotion Recognition</h1>
+                <p>Upload a voice sample and get emotion insights with waveform, MFCC, and prediction visuals.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown('<p class="panel-title">Upload Audio</p>', unsafe_allow_html=True)
         with st.container():
             col1, col2 = st.columns(2)
             # audio_file = None
@@ -184,12 +476,19 @@ def main():
                         st.warning("File size is too large. Try another file.")
                     elif if_save_audio == 0:
                         # extract features
-                        # display audio
-                        st.audio(audio_file, format='audio/wav', start_time=0)
                         try:
                             wav, sr = librosa.load(path, sr=44100)
                             Xdb = get_melspec(path)[1]
-                            mfccs = librosa.feature.mfcc(wav, sr=sr)
+                            mfccs = librosa.feature.mfcc(y=wav, sr=sr)
+                            model_input = prepare_mfcc_input(path, model)
+                            pred = model.predict(model_input, verbose=0)[0]
+                            pred = remap_pred_to_ui(pred)
+                            pos, neu, neg = sentiment_scores_from_ui(pred)
+                            data3 = np.array([pos, neu, neg])
+                            top_emotion = CAT6[int(pred.argmax())]
+                            top_conf = float(pred.max()) * 100
+                            sentiment = CAT3[int(data3.argmax())]
+                            st.audio(audio_file, format='audio/wav', start_time=0)
                             # # display audio
                             # st.audio(audio_file, format='audio/wav', start_time=0)
                         except Exception as e:
@@ -197,29 +496,25 @@ def main():
                             st.error(f"Error {e} - wrong format of the file. Try another .wav file.")
                     else:
                         st.error("Unknown error")
-                else:
-                    if st.button("Try test file"):
-                        wav, sr = librosa.load("test.wav", sr=44100)
-                        Xdb = get_melspec("test.wav")[1]
-                        mfccs = librosa.feature.mfcc(wav, sr=sr)
-                        # display audio
-                        st.audio("test.wav", format='audio/wav', start_time=0)
-                        path = "test.wav"
-                        audio_file = "test"
             with col2:
-                if audio_file is not None:
-                    fig = plt.figure(figsize=(10, 2))
-                    fig.set_facecolor('#d1d1e0')
-                    plt.title("Wave-form")
-                    librosa.display.waveplot(wav, sr=44100)
-                    plt.gca().axes.get_yaxis().set_visible(False)
-                    plt.gca().axes.get_xaxis().set_visible(False)
-                    plt.gca().axes.spines["right"].set_visible(False)
-                    plt.gca().axes.spines["left"].set_visible(False)
-                    plt.gca().axes.spines["top"].set_visible(False)
-                    plt.gca().axes.spines["bottom"].set_visible(False)
-                    plt.gca().axes.set_facecolor('#d1d1e0')
-                    st.write(fig)
+                if audio_file is not None and top_emotion is not None:
+                    emoji = EMOTION_EMOJI.get(top_emotion, "")
+                    st.markdown("<div style='height: 2.2rem'></div>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"""
+                        <div class="result-card">
+                            <p class="result-label">Detected Emotion</p>
+                            <p class="result-main">{emoji} {top_emotion.title()} ({top_conf:.1f}%)</p>
+                            <p class="result-sub">Overall tone: {sentiment.title()}</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    idx = {name: i for i, name in enumerate(CAT6)}
+                    st.caption(
+                        f"Confidence mix | Happy: {pred[idx['happy']]:.2f}  Sad: {pred[idx['sad']]:.2f}  "
+                        f"Angry: {pred[idx['angry']]:.2f}  Fear: {pred[idx['fear']]:.2f}"
+                    )
                 else:
                     pass
             #     st.write("Record audio file")
@@ -229,18 +524,6 @@ def main():
             #             time.sleep(3)
             #         st.success("Recording completed")
             #         st.write("Error while loading the file")
-
-        if model_type == "mfccs":
-            em3 = st.sidebar.checkbox("3 emotions", True)
-            em6 = st.sidebar.checkbox("6 emotions", True)
-            em7 = st.sidebar.checkbox("7 emotions")
-            gender = st.sidebar.checkbox("gender")
-
-        elif model_type == "mel-specs":
-            st.sidebar.warning("This model is temporarily disabled")
-
-        else:
-            st.sidebar.warning("This model is temporarily disabled")
 
         # with st.sidebar.expander("Change colors"):
         #     st.sidebar.write("Use this options after you got the plots")
@@ -274,48 +557,58 @@ def main():
         #         st.success(COLOR_DICT)
 
         if audio_file is not None:
-            st.markdown("## Analyzing...")
-            if not audio_file == "test":
-                st.sidebar.subheader("Audio file")
-                file_details = {"Filename": audio_file.name, "FileSize": audio_file.size}
-                st.sidebar.write(file_details)
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            st.markdown('<p class="panel-title">Analyzing Audio</p>', unsafe_allow_html=True)
 
+            with st.container():
+                fig = plt.figure(figsize=(10, 1.35))
+                fig.set_facecolor('#d1d1e0')
+                plt.title("Wave-form")
+                librosa.display.waveshow(wav, sr=44100)
+                plt.gca().axes.get_yaxis().set_visible(False)
+                plt.gca().axes.get_xaxis().set_visible(False)
+                plt.gca().axes.spines["right"].set_visible(False)
+                plt.gca().axes.spines["left"].set_visible(False)
+                plt.gca().axes.spines["top"].set_visible(False)
+                plt.gca().axes.spines["bottom"].set_visible(False)
+                plt.gca().axes.set_facecolor('#d1d1e0')
+                st.write(fig)
             with st.container():
                 col1, col2 = st.columns(2)
                 with col1:
-                    fig = plt.figure(figsize=(10, 2))
-                    fig.set_facecolor('#d1d1e0')
+                    fig2 = plt.figure(figsize=(10, 2.5))
+                    fig2.set_facecolor('#d1d1e0')
                     plt.title("MFCCs")
                     librosa.display.specshow(mfccs, sr=sr, x_axis='time')
                     plt.gca().axes.get_yaxis().set_visible(False)
                     plt.gca().axes.spines["right"].set_visible(False)
                     plt.gca().axes.spines["left"].set_visible(False)
                     plt.gca().axes.spines["top"].set_visible(False)
-                    st.write(fig)
+                    st.write(fig2)
                 with col2:
-                    fig2 = plt.figure(figsize=(10, 2))
-                    fig2.set_facecolor('#d1d1e0')
+                    fig3 = plt.figure(figsize=(10, 2.5))
+                    fig3.set_facecolor('#d1d1e0')
                     plt.title("Mel-log-spectrogram")
                     librosa.display.specshow(Xdb, sr=sr, x_axis='time', y_axis='hz')
                     plt.gca().axes.get_yaxis().set_visible(False)
                     plt.gca().axes.spines["right"].set_visible(False)
                     plt.gca().axes.spines["left"].set_visible(False)
                     plt.gca().axes.spines["top"].set_visible(False)
-                    st.write(fig2)
+                    st.write(fig3)
 
             if model_type == "mfccs":
-                st.markdown("## Predictions")
+                st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+                st.markdown('<p class="panel-title">Predictions</p>', unsafe_allow_html=True)
                 with st.container():
-                    col1, col2, col3, col4 = st.columns(4)
-                    mfccs = get_mfccs(path, model.input_shape[-1])
-                    mfccs = mfccs.reshape(1, *mfccs.shape)
-                    pred = model.predict(mfccs)[0]
+                    col1, col2, col3 = st.columns(3)
+                    if pred is None:
+                        mfccs_input = prepare_mfcc_input(path, model)
+                        pred = model.predict(mfccs_input, verbose=0)[0]
+                        pred = remap_pred_to_ui(pred)
 
                     with col1:
                         if em3:
-                            pos = pred[3] + pred[5] * .5
-                            neu = pred[2] + pred[5] * .5 + pred[4] * .5
-                            neg = pred[0] + pred[1] + pred[4] * .5
+                            pos, neu, neg = sentiment_scores_from_ui(pred)
                             data3 = np.array([pos, neu, neg])
                             txt = "MFCCs\n" + get_title(data3, CAT3)
                             fig = plt.figure(figsize=(5, 5))
@@ -336,37 +629,30 @@ def main():
                             #            title=txt, colors=COLORS)
                             st.write(fig2)
                     with col3:
-                        if em7:
-                            model_ = load_model("model4.h5")
-                            mfccs_ = get_mfccs(path, model_.input_shape[-2])
-                            mfccs_ = mfccs_.T.reshape(1, *mfccs_.T.shape)
-                            pred_ = model_.predict(mfccs_)[0]
-                            txt = "MFCCs\n" + get_title(pred_, CAT7)
-                            fig3 = plt.figure(figsize=(5, 5))
-                            COLORS = color_dict(COLOR_DICT)
-                            plot_colored_polar(fig3, predictions=pred_, categories=CAT7,
-                                               title=txt, colors=COLORS)
-                            # plot_polar(fig3, predictions=pred_, categories=CAT7,
-                            #            title=txt, colors=COLORS)
-                            st.write(fig3)
-                    with col4:
                         if gender:
                             with st.spinner('Wait for it...'):
-                                gmodel = load_model("model_mw.h5")
-                                gmfccs = get_mfccs(path, gmodel.input_shape[-1])
-                                gmfccs = gmfccs.reshape(1, *gmfccs.shape)
-                                gpred = gmodel.predict(gmfccs)[0]
-                                gdict = [["female", "woman.png"], ["male", "man.png"]]
-                                ind = gpred.argmax()
-                                txt = "Predicted gender: " + gdict[ind][0]
-                                img = Image.open("images/" + gdict[ind][1])
+                                if not os.path.exists(GENDER_MODEL_PATH):
+                                    st.warning(
+                                        "Gender model not found. "
+                                        "Train it with `python train_from_scratch.py`."
+                                    )
+                                    gmodel = None
+                                else:
+                                    gmodel = load_model(GENDER_MODEL_PATH)
+                                if gmodel is not None:
+                                    gmfccs = prepare_mfcc_input(path, gmodel)
+                                    gpred = gmodel.predict(gmfccs)[0]
+                                    gdict = [["female", "woman.png"], ["male", "man.png"]]
+                                    ind = gpred.argmax()
+                                    txt = "Predicted gender: " + gdict[ind][0]
+                                    img = Image.open("images/" + gdict[ind][1])
 
-                                fig4 = plt.figure(figsize=(3, 3))
-                                fig4.set_facecolor('#d1d1e0')
-                                plt.title(txt)
-                                plt.imshow(img)
-                                plt.axis("off")
-                                st.write(fig4)
+                                    fig4 = plt.figure(figsize=(5, 5))
+                                    fig4.set_facecolor('#d1d1e0')
+                                    plt.title(txt)
+                                    plt.imshow(img)
+                                    plt.axis("off")
+                                    st.write(fig4)
 
             # if model_type == "mel-specs":
             # st.markdown("## Predictions")

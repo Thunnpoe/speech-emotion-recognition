@@ -5,6 +5,7 @@ import librosa.display
 from tensorflow.keras.models import load_model
 from datetime import datetime
 import matplotlib.pyplot as plt
+import os
 
 # constants
 starttime = datetime.now()
@@ -30,7 +31,7 @@ TEST_PRED = np.array([.3,.3,.4,.1,.6,.9,.1])
 # st.set_page_config(page_title="SER web-app", page_icon=":speech_balloon:", layout="wide")
 
 def get_melspec(audio):
-  y, sr = librosa.load(audio, sr=44100)
+  y, sr = librosa.load(audio, sr=22050)
   X = librosa.stft(y)
   Xdb = librosa.amplitude_to_db(abs(X))
   img = np.stack((Xdb,) * 3,-1)
@@ -90,7 +91,12 @@ def plot_melspec(path, tmodel=None, three=False,
                  CAT3=CAT3, CAT6=CAT6):
     # load model if it is not loaded
     if tmodel is None:
-        tmodel = load_model("tmodel_all.h5")
+        tmodel_path = os.getenv("MELSPEC_MODEL_PATH", "tmodel_self_trained.h5")
+        if not os.path.exists(tmodel_path):
+            raise FileNotFoundError(
+                f"Missing self-trained mel-spec model: {tmodel_path}"
+            )
+        tmodel = load_model(tmodel_path)
     # mel-spec model results
     mel = get_melspec(path)[0]
     mel = mel.reshape(1, *mel.shape)
