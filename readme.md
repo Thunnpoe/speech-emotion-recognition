@@ -50,8 +50,6 @@ speech-emotion-recognition/
 - **Architecture**: CNN with MFCC features
 - **Performance**: 91.1% emotion accuracy, 98.6% gender accuracy
 
-## License
-MIT License
 
 ---
 
