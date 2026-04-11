@@ -24,3 +24,6 @@ archive/test1.txt
 model_tal.h5
 our_streamlit_key.pem
 streamlit.pem
+
+.venvtrain/
+
